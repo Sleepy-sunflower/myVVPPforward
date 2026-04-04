@@ -1,10 +1,8 @@
 import os
 import sys
-import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from torch_geometric.loader import DataLoader as PyGDataLoader
-from torch.utils.data import random_split
+from torch.utils.data import DataLoader, random_split
 
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -13,9 +11,7 @@ if project_root not in sys.path:
 
 from config.config import cfg
 from src.pipeline import MyPipeline
-# Assuming you will use EigenMeshDataset or VVImpactDataset for training
-from src.eigen_dataset import EigenMeshDataset
-# from src.dataset_loader import VVImpactDataset
+from src.dataset_loader import VVImpactDataset, collate_vvimpact_batch
 
 def main():
     print("="*50)
@@ -28,11 +24,10 @@ def main():
     # 2. Load Dataset
     print(f"Loading dataset from {cfg.DATA_DIR}...")
     
-    # You can change this to VVImpactDataset depending on your task
-    dataset = EigenMeshDataset(
-        data_dir=os.path.join(cfg.DATA_DIR, "coarse_eigen_mesh"),
-        cache_dir=os.path.join(cfg.DATA_DIR, "cache"),
-        k=cfg.N_EIGENMODES
+    dataset = VVImpactDataset(
+        data_dir=cfg.DATA_DIR,
+        sample_rate=cfg.SAMPLE_RATE,
+        n_mels=cfg.N_MELS,
     )
     
     if len(dataset) == 0:
@@ -44,22 +39,22 @@ def main():
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
-    # Create DataLoaders
-    # Using PyTorch Geometric DataLoader to properly batch graph data (handles pos, x, batch_idx correctly)
-    train_loader = PyGDataLoader(
+    train_loader = DataLoader(
         train_dataset, 
         batch_size=cfg.BATCH_SIZE, 
         shuffle=True, 
         num_workers=cfg.NUM_WORKERS,
-        persistent_workers=True if cfg.NUM_WORKERS > 0 else False
+        persistent_workers=True if cfg.NUM_WORKERS > 0 else False,
+        collate_fn=collate_vvimpact_batch,
     )
     
-    val_loader = PyGDataLoader(
+    val_loader = DataLoader(
         val_dataset, 
         batch_size=cfg.BATCH_SIZE, 
         shuffle=False, 
         num_workers=cfg.NUM_WORKERS,
-        persistent_workers=True if cfg.NUM_WORKERS > 0 else False
+        persistent_workers=True if cfg.NUM_WORKERS > 0 else False,
+        collate_fn=collate_vvimpact_batch,
     )
     
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
