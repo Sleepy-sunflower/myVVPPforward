@@ -19,19 +19,43 @@ import src.models.ocnn_model_ref.my_ocnn as ocnn_unet
 
 
 class AcousticFieldHead(nn.Module):
-    def __init__(self, hidden_dim, output_dim, pe_frequencies=6):
+    def __init__(self, hidden_dim, output_dim, pe_frequencies=6, coarse_bins=64, attention_heads=4):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.pe_frequencies = pe_frequencies
+        self.coarse_bins = coarse_bins
         self.register_buffer(
             "frequency_bands",
             (2.0 ** torch.arange(pe_frequencies, dtype=torch.float32)) * torch.pi,
             persistent=False,
         )
-        input_dim = hidden_dim + 3 + 3 * 2 * pe_frequencies
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim * 2),
+        position_dim = 3 + 3 * 2 * pe_frequencies
+        local_input_dim = hidden_dim + position_dim
+        global_input_dim = hidden_dim * 2
+        self.local_encoder = nn.Sequential(
+            nn.Linear(local_input_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.global_encoder = nn.Sequential(
+            nn.Linear(global_input_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.cross_attention = nn.MultiheadAttention(hidden_dim, attention_heads, batch_first=True)
+        self.attention_norm = nn.LayerNorm(hidden_dim)
+        self.coarse_predictor = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, coarse_bins),
+        )
+        self.residual_predictor = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + output_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Linear(hidden_dim * 2, hidden_dim * 2),
             nn.GELU(),
@@ -45,9 +69,28 @@ class AcousticFieldHead(nn.Module):
         pe = torch.cat([scaled_xyz.sin(), scaled_xyz.cos()], dim=-1).reshape(xyz.size(0), -1)
         return torch.cat([xyz, pe], dim=-1)
 
-    def forward(self, point_features, xyz):
-        fused_features = torch.cat([point_features, self.positional_encoding(xyz)], dim=-1)
-        return self.layers(fused_features)
+    def forward(self, point_features, global_features, xyz):
+        local_token = self.local_encoder(torch.cat([point_features, self.positional_encoding(xyz)], dim=-1))
+        global_token = self.global_encoder(global_features)
+        attention_input = torch.stack([local_token, global_token], dim=1)
+        attention_output, _ = self.cross_attention(
+            local_token.unsqueeze(1),
+            attention_input,
+            attention_input,
+            need_weights=False,
+        )
+        fused_local_token = self.attention_norm(local_token + attention_output.squeeze(1))
+        coarse_features = torch.cat([fused_local_token, global_token], dim=-1)
+        coarse_logits = self.coarse_predictor(coarse_features)
+        coarse_output = F.interpolate(
+            coarse_logits.unsqueeze(1),
+            size=self.output_dim,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(1)
+        residual_output = self.residual_predictor(torch.cat([fused_local_token, global_token, coarse_output], dim=-1))
+        final_output = coarse_output + residual_output
+        return final_output, coarse_output, residual_output
 
 
 class MyPipeline(pl.LightningModule):
@@ -56,10 +99,16 @@ class MyPipeline(pl.LightningModule):
         self.learning_rate = learning_rate if learning_rate is not None else getattr(cfg, "LEARNING_RATE", 1e-3)
         self.hidden_dim = getattr(cfg, "HIDDEN_DIM", 256)
         self.output_dim = getattr(cfg, "OUTPUT_DIM", 256)
+        self.global_context_points = max(1, int(getattr(cfg, "GLOBAL_CONTEXT_POINTS", 512)))
         self.train_vis_every_n_epochs = max(1, int(getattr(cfg, "TRAIN_VIS_EVERY_N_EPOCHS", 1)))
         self.input_feature = ocnn.modules.InputFeature("NPD", nempty=cfg.OCTREE_NEMPTY)
         self.backbone_network = ocnn_unet.UNet(in_channels=7, out_channels=self.hidden_dim, nempty=cfg.OCTREE_NEMPTY)
-        self.acoustic_head = AcousticFieldHead(self.hidden_dim, self.output_dim)
+        self.acoustic_head = AcousticFieldHead(
+            self.hidden_dim,
+            self.output_dim,
+            coarse_bins=max(8, int(getattr(cfg, "COARSE_BINS", 64))),
+            attention_heads=max(1, int(getattr(cfg, "HEAD_ATTENTION_HEADS", 4))),
+        )
 
     def build_targets(self, batch_data):
         targets = torch.cat([mel.float().to(self.device).max(dim=-1).values for mel in batch_data["mel_spectrogram"]], dim=0)
@@ -76,6 +125,22 @@ class MyPipeline(pl.LightningModule):
         emd_loss = (pred_cdf - target_cdf).abs().mean()
         total_loss = smooth_l1_loss * 1 + emd_loss * 1
         return total_loss, smooth_l1_loss, emd_loss
+
+    def select_global_context_points(self, vertices):
+        if vertices.size(0) <= self.global_context_points:
+            return vertices
+        step = max(1, (vertices.size(0) + self.global_context_points - 1) // self.global_context_points)
+        return vertices[::step][:self.global_context_points]
+
+    def build_batched_query_points(self, point_groups):
+        point_xyz = torch.cat(point_groups, dim=0)
+        point_counts = torch.tensor([points.size(0) for points in point_groups], dtype=torch.long, device=self.device)
+        query_batch_index = torch.repeat_interleave(
+            torch.arange(len(point_groups), device=self.device, dtype=torch.long),
+            point_counts,
+        )
+        query_pts = torch.cat([point_xyz, query_batch_index[:, None].float()], dim=1)
+        return point_xyz, query_pts, point_counts
 
     def build_prediction_report(self, batch_data, targets, output, loss, stage):
         gt = targets.detach().cpu()
@@ -176,26 +241,51 @@ class MyPipeline(pl.LightningModule):
 
     def forward(self, batch_data):
         impact_points = [points.to(self.device) for points in batch_data["impact_point"]]
+        global_context_points = [
+            self.select_global_context_points(vertices.to(self.device))
+            for vertices in batch_data["gnn_vertices"]
+        ]
         octree = batch_data["octree"].to(self.device)
         data = self.input_feature(octree)
         targets = self.build_targets(batch_data)
+        combined_query_groups = [
+            torch.cat([impact_point, context_point], dim=0)
+            for impact_point, context_point in zip(impact_points, global_context_points)
+        ]
+        point_xyz, query_pts, _ = self.build_batched_query_points(combined_query_groups)
+        combined_features = self.backbone_network(data=data, octree=octree, depth=octree.depth, query_pts=query_pts)
+        local_feature_groups = []
+        global_feature_groups = []
+        split_sizes = [points.size(0) for points in combined_query_groups]
+        for impact_point, context_point, feature_group in zip(
+            impact_points,
+            global_context_points,
+            combined_features.split(split_sizes),
+        ):
+            impact_count = impact_point.size(0)
+            local_features = feature_group[:impact_count]
+            context_features = feature_group[impact_count:impact_count + context_point.size(0)]
+            pooled_context = torch.cat(
+                [context_features.mean(dim=0), context_features.max(dim=0).values],
+                dim=0,
+            )
+            global_features = pooled_context.unsqueeze(0).expand(impact_count, -1)
+            local_feature_groups.append(local_features)
+            global_feature_groups.append(global_features)
         point_xyz = torch.cat(impact_points, dim=0)
-        impact_counts = torch.tensor([points.size(0) for points in impact_points], dtype=torch.long, device=self.device)
-        query_batch_index = torch.repeat_interleave(
-            torch.arange(len(impact_points), device=self.device, dtype=torch.long),
-            impact_counts,
-        )
-        query_pts = torch.cat([point_xyz, query_batch_index[:, None].float()], dim=1)
-        point_features = self.backbone_network(data=data, octree=octree, depth=octree.depth, query_pts=query_pts)
-        output = self.acoustic_head(point_features, point_xyz)
+        local_features = torch.cat(local_feature_groups, dim=0)
+        global_features = torch.cat(global_feature_groups, dim=0)
+        output, coarse_output, residual_output = self.acoustic_head(local_features, global_features, point_xyz)
         loss, smooth_l1_loss, emd_loss = self.compute_loss_terms(output, targets)
-        return loss, output, smooth_l1_loss, emd_loss
+        return loss, output, smooth_l1_loss, emd_loss, coarse_output, residual_output
 
     def training_step(self, batch, batch_idx):
-        loss, output, smooth_l1_loss, emd_loss = self(batch)
+        loss, output, smooth_l1_loss, emd_loss, coarse_output, residual_output = self(batch)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("train_smooth_l1_loss", smooth_l1_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("train_emd_loss", emd_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("train_coarse_abs_mean", coarse_output.abs().mean(), on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("train_residual_abs_mean", residual_output.abs().mean(), on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         
         opt = self.optimizers()
         if opt:
@@ -210,10 +300,12 @@ class MyPipeline(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, output, smooth_l1_loss, emd_loss = self(batch)
+        loss, output, smooth_l1_loss, emd_loss, coarse_output, residual_output = self(batch)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("val_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("val_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("val_coarse_abs_mean", coarse_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("val_residual_abs_mean", residual_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         if batch_idx == 0 and getattr(self.logger, "experiment", None) is not None:
             targets = self.build_targets(batch)
             report = self.build_prediction_report(batch, targets, output, loss, stage="val")
@@ -221,10 +313,12 @@ class MyPipeline(pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, _, smooth_l1_loss, emd_loss = self(batch)
+        loss, _, smooth_l1_loss, emd_loss, coarse_output, residual_output = self(batch)
         self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("test_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("test_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("test_coarse_abs_mean", coarse_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("test_residual_abs_mean", residual_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         return loss
 
     def configure_optimizers(self):
