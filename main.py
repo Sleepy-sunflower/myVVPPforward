@@ -1,10 +1,13 @@
+import math
 import os
 import sys
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -14,6 +17,35 @@ if project_root not in sys.path:
 from config.config import cfg
 from src.pipeline import MyPipeline
 from src.dataset_loader import VVImpactDataset, collate_vvimpact_batch
+
+
+def build_train_val_subsets(dataset):
+    dataset_percent = float(getattr(cfg, "DATASET_PERCENT", 100.0))
+    if not 0 < dataset_percent <= 100:
+        raise ValueError(f"DATASET_PERCENT must be in (0, 100], got {dataset_percent}.")
+
+    total_size = len(dataset)
+    subset_size = math.ceil(total_size * dataset_percent / 100.0)
+    if total_size >= 2:
+        subset_size = max(2, subset_size)
+    subset_size = min(total_size, subset_size)
+
+    indices = torch.randperm(total_size).tolist()[:subset_size]
+    if subset_size == 1:
+        train_indices = [indices[0]]
+        val_indices = [indices[0]]
+    else:
+        train_size = max(1, int(subset_size * 0.8))
+        if train_size >= subset_size:
+            train_size = subset_size - 1
+        val_size = subset_size - train_size
+        if val_size == 0:
+            val_size = 1
+            train_size -= 1
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+
+    return Subset(dataset, train_indices), Subset(dataset, val_indices), subset_size
 
 
 def main():
@@ -37,10 +69,7 @@ def main():
         print("Warning: Dataset is empty. Cannot start training.")
         return
         
-    # Split dataset (80% train, 20% val)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_dataset, val_dataset, subset_size = build_train_val_subsets(dataset)
     
     train_loader = DataLoader(
         train_dataset, 
@@ -60,7 +89,10 @@ def main():
         collate_fn=collate_vvimpact_batch,
     )
     
-    print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
+    print(
+        f"Using {subset_size}/{len(dataset)} samples "
+        f"({cfg.DATASET_PERCENT:.2f}%) | Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}"
+    )
     
     # 3. Initialize Model Pipeline
     print("Initializing Model Pipeline...")
@@ -104,6 +136,7 @@ def main():
         callbacks=[checkpoint_callback, early_stop_callback],
         accelerator=accelerator,
         devices=devices,
+        check_val_every_n_epoch=max(1, int(getattr(cfg, "VAL_EVERY_N_EPOCHS", 1))),
         log_every_n_steps=5,
         logger=tensorboard_logger,
         enable_progress_bar=True,

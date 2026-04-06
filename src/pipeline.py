@@ -19,16 +19,35 @@ import src.models.ocnn_model_ref.my_ocnn as ocnn_unet
 
 
 class AcousticFieldHead(nn.Module):
-    def __init__(self, hidden_dim, output_dim):
+    def __init__(self, hidden_dim, output_dim, pe_frequencies=6):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.pe_frequencies = pe_frequencies
+        self.register_buffer(
+            "frequency_bands",
+            (2.0 ** torch.arange(pe_frequencies, dtype=torch.float32)) * torch.pi,
+            persistent=False,
+        )
+        input_dim = hidden_dim + 3 + 3 * 2 * pe_frequencies
         self.layers = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(input_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
         )
 
-    def forward(self, vertex_features):
-        return self.layers(vertex_features)
+    def positional_encoding(self, xyz):
+        scaled_xyz = xyz.unsqueeze(-1) * self.frequency_bands.view(1, 1, -1)
+        pe = torch.cat([scaled_xyz.sin(), scaled_xyz.cos()], dim=-1).reshape(xyz.size(0), -1)
+        return torch.cat([xyz, pe], dim=-1)
+
+    def forward(self, point_features, xyz):
+        fused_features = torch.cat([point_features, self.positional_encoding(xyz)], dim=-1)
+        return self.layers(fused_features)
 
 
 class MyPipeline(pl.LightningModule):
@@ -37,6 +56,7 @@ class MyPipeline(pl.LightningModule):
         self.learning_rate = learning_rate if learning_rate is not None else getattr(cfg, "LEARNING_RATE", 1e-3)
         self.hidden_dim = getattr(cfg, "HIDDEN_DIM", 256)
         self.output_dim = getattr(cfg, "OUTPUT_DIM", 256)
+        self.train_vis_every_n_epochs = max(1, int(getattr(cfg, "TRAIN_VIS_EVERY_N_EPOCHS", 1)))
         self.input_feature = ocnn.modules.InputFeature("NPD", nempty=cfg.OCTREE_NEMPTY)
         self.backbone_network = ocnn_unet.UNet(in_channels=7, out_channels=self.hidden_dim, nempty=cfg.OCTREE_NEMPTY)
         self.acoustic_head = AcousticFieldHead(self.hidden_dim, self.output_dim)
@@ -44,6 +64,18 @@ class MyPipeline(pl.LightningModule):
     def build_targets(self, batch_data):
         targets = torch.cat([mel.float().to(self.device).max(dim=-1).values for mel in batch_data["mel_spectrogram"]], dim=0)
         return F.adaptive_avg_pool1d(targets.unsqueeze(1), self.output_dim).squeeze(1)
+
+    def compute_loss_terms(self, output, targets):
+        smooth_l1_loss = F.smooth_l1_loss(output, targets)
+        pred_dist = F.softplus(output)
+        target_dist = targets.clamp_min(0)
+        pred_dist = pred_dist / pred_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        pred_cdf = torch.cumsum(pred_dist, dim=-1)
+        target_cdf = torch.cumsum(target_dist, dim=-1)
+        emd_loss = (pred_cdf - target_cdf).abs().mean()
+        total_loss = smooth_l1_loss * 1 + emd_loss * 1
+        return total_loss, smooth_l1_loss, emd_loss
 
     def build_prediction_report(self, batch_data, targets, output, loss, stage):
         gt = targets.detach().cpu()
@@ -118,13 +150,16 @@ class MyPipeline(pl.LightningModule):
         ax_scatter.set_ylabel(axis_names[axis_y])
         ax_scatter.legend()
 
+        vmin = min(gt_panel.min().item(), pred_panel.min().item())
+        vmax = max(gt_panel.max().item(), pred_panel.max().item())
+
         ax_gt = fig.add_subplot(gs[2, 0])
-        im_gt = ax_gt.imshow(gt_panel.numpy(), aspect="auto", cmap="viridis")
+        im_gt = ax_gt.imshow(gt_panel.numpy(), aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
         ax_gt.set_title("GT Heatmap")
         fig.colorbar(im_gt, ax=ax_gt, fraction=0.046, pad=0.04)
 
         ax_pred = fig.add_subplot(gs[2, 1])
-        im_pred = ax_pred.imshow(pred_panel.numpy(), aspect="auto", cmap="viridis")
+        im_pred = ax_pred.imshow(pred_panel.numpy(), aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
         ax_pred.set_title("Pred Heatmap")
         fig.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
 
@@ -140,42 +175,45 @@ class MyPipeline(pl.LightningModule):
         return image
 
     def forward(self, batch_data):
-        positions = [pos.to(self.device) for pos in batch_data["gnn_vertices"]]
+        impact_points = [points.to(self.device) for points in batch_data["impact_point"]]
         octree = batch_data["octree"].to(self.device)
         data = self.input_feature(octree)
-        offsets = torch.tensor([0] + [pos.size(0) for pos in positions[:-1]], dtype=torch.long, device=self.device).cumsum(0)
-        hit_face_indices = torch.cat([
-            gnn_face_index.to(self.device).long() + offset
-            for gnn_face_index, offset in zip(batch_data["gnn_face_index"], offsets)
-        ], dim=0)
-        hit_barycentric = torch.cat([weights.to(self.device) for weights in batch_data["gnn_barycentric"]], dim=0)
         targets = self.build_targets(batch_data)
-        query_batch_index = torch.cat(
-            [torch.full((pos.size(0),), idx, dtype=torch.long, device=self.device) for idx, pos in enumerate(positions)],
-            dim=0,
+        point_xyz = torch.cat(impact_points, dim=0)
+        impact_counts = torch.tensor([points.size(0) for points in impact_points], dtype=torch.long, device=self.device)
+        query_batch_index = torch.repeat_interleave(
+            torch.arange(len(impact_points), device=self.device, dtype=torch.long),
+            impact_counts,
         )
-        query_pts = torch.cat(
-            [torch.cat([pos, batch_idx[:, None].float()], dim=1) for pos, batch_idx in zip(positions, query_batch_index.split([pos.size(0) for pos in positions]))],
-            dim=0,
-        )
-        vertex_features = self.backbone_network(data=data, octree=octree, depth=octree.depth, query_pts=query_pts)
-        vertex_embeddings = self.acoustic_head(vertex_features)
-        output = (vertex_embeddings[hit_face_indices] * hit_barycentric.unsqueeze(-1)).sum(dim=1)
-        loss = F.smooth_l1_loss(output, targets)
-        return loss, output
+        query_pts = torch.cat([point_xyz, query_batch_index[:, None].float()], dim=1)
+        point_features = self.backbone_network(data=data, octree=octree, depth=octree.depth, query_pts=query_pts)
+        output = self.acoustic_head(point_features, point_xyz)
+        loss, smooth_l1_loss, emd_loss = self.compute_loss_terms(output, targets)
+        return loss, output, smooth_l1_loss, emd_loss
 
     def training_step(self, batch, batch_idx):
-        loss, output = self(batch)
+        loss, output, smooth_l1_loss, emd_loss = self(batch)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
-        if batch_idx == 0 and getattr(self.logger, "experiment", None) is not None:
+        self.log("train_smooth_l1_loss", smooth_l1_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("train_emd_loss", emd_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        
+        opt = self.optimizers()
+        if opt:
+            lr = opt.param_groups[0]["lr"]
+            self.log("lr", lr, on_step=False, on_epoch=True, prog_bar=True)
+            
+        should_log_train_visualization = (self.current_epoch + 1) % self.train_vis_every_n_epochs == 0
+        if batch_idx == 0 and should_log_train_visualization and getattr(self.logger, "experiment", None) is not None:
             targets = self.build_targets(batch)
             report = self.build_prediction_report(batch, targets, output, loss, stage="train")
             self.logger.experiment.add_image("train/gt_pred_absdiff", report, self.current_epoch)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, output = self(batch)
+        loss, output, smooth_l1_loss, emd_loss = self(batch)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+        self.log("val_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("val_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         if batch_idx == 0 and getattr(self.logger, "experiment", None) is not None:
             targets = self.build_targets(batch)
             report = self.build_prediction_report(batch, targets, output, loss, stage="val")
@@ -183,8 +221,10 @@ class MyPipeline(pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, _ = self(batch)
+        loss, _, smooth_l1_loss, emd_loss = self(batch)
         self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
+        self.log("test_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        self.log("test_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         return loss
 
     def configure_optimizers(self):
@@ -196,16 +236,16 @@ class MyPipeline(pl.LightningModule):
             lr=self.learning_rate,
             weight_decay=getattr(cfg, "WEIGHT_DECAY", 0.0),
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        total_epochs = max(1, int(getattr(cfg, "MAX_EPOCHS", 1)))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            mode="min",
-            factor=0.5,
-            patience=5,
+            lr_lambda=lambda epoch: max(0.0, 1.0 - epoch / total_epochs),
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
             },
         }

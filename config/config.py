@@ -8,10 +8,13 @@ class Config:
     BATCH_SIZE = 1
     # 最大训练轮数
     MAX_EPOCHS = 100
+    DATASET_PERCENT = 3.0
+    VAL_EVERY_N_EPOCHS = 10
+    TRAIN_VIS_EVERY_N_EPOCHS = 10
     # 权重衰减系数
     WEIGHT_DECAY = 1e-4
     # 训练设备类型，可选 cpu / cuda / mps
-    DEVICE = "cpu"
+    DEVICE = "cuda"
     # 使用的设备数量
     DEVICES = 1
 
