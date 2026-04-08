@@ -16,3 +16,6 @@ libigl
 tqdm
 lightning
 rtree
+pymeshlab
+tensorboard
+ocnn==2.2.8

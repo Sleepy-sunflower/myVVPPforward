@@ -66,14 +66,19 @@ class UNet(torch.nn.Module):
     r''' Configure the network channels and Resblock numbers.
     '''
 
-    self.encoder_channel = [64, 64, 64, 128]
-    self.decoder_channel = [128, 128, 128, 128]
+   # self.encoder_channel = [64, 64, 64, 128]
+   # self.decoder_channel = [128, 128, 128, 128]
+
+   # self.encoder_blocks = [2, 3, 3]
+   # self.decoder_blocks = [2, 2, 2]
     
-   # self.encoder_channel = [128, 128, 128, 256, 256]
-   # self.decoder_channel = [256, 256, 256, 256, 256]
+    self.encoder_channel = [128, 128, 128, 256, 256]
+    self.decoder_channel = [256, 256, 256, 256, 256]
+
+    self.encoder_blocks = [2, 3, 3, 3]
+    self.decoder_blocks = [2, 2, 2, 2]
     
-    self.encoder_blocks = [2, 3, 3]
-    self.decoder_blocks = [2, 2, 2]
+
     self.head_channel = 256
     self.bottleneck = 1
     #self.resblk = ocnn.modules.OctreeResBlock2

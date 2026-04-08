@@ -109,10 +109,11 @@ def main():
         mode="min"
     )
     
-    # Early stopping
+    # Early stopping (通过配置文件控制耐心值)
+    early_stop_patience = getattr(cfg, "EARLY_STOP_PATIENCE", 50)
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
-        patience=10,
+        patience=early_stop_patience,
         verbose=False,
         mode="min"
     )

@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import ocnn
 import pytorch_lightning as pl
+from scipy.optimize import linear_sum_assignment
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,12 +20,12 @@ import src.models.ocnn_model_ref.my_ocnn as ocnn_unet
 
 
 class AcousticFieldHead(nn.Module):
-    def __init__(self, hidden_dim, output_dim, pe_frequencies=6, coarse_bins=64, attention_heads=4):
+    def __init__(self, hidden_dim, output_dim, pe_frequencies=6, attention_heads=4, num_peaks=12):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.pe_frequencies = pe_frequencies
-        self.coarse_bins = coarse_bins
+        self.num_peaks = num_peaks
         self.register_buffer(
             "frequency_bands",
             (2.0 ** torch.arange(pe_frequencies, dtype=torch.float32)) * torch.pi,
@@ -47,21 +48,32 @@ class AcousticFieldHead(nn.Module):
         )
         self.cross_attention = nn.MultiheadAttention(hidden_dim, attention_heads, batch_first=True)
         self.attention_norm = nn.LayerNorm(hidden_dim)
-        self.coarse_predictor = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, coarse_bins),
-        )
-        self.residual_predictor = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + output_dim, hidden_dim * 2),
-            nn.GELU(),
+        
+        # 1. 直接预测方案 (Direct)
+        self.predictor_direct = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim * 2),
             nn.GELU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, output_dim),
+        )
+        
+        # 2. 匈牙利匹配方案 (Bipartite) - 预测 12 个峰 (freq, amp, width)
+        self.predictor_bipartite = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_peaks * 3),
+        )
+        
+        # 3. 锚点分箱方案 (Anchor) - 预测 12 个 bin (base_val, offset, amp, width)
+        self.predictor_anchor = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_peaks * 4),
         )
 
     def positional_encoding(self, xyz):
@@ -69,7 +81,66 @@ class AcousticFieldHead(nn.Module):
         pe = torch.cat([scaled_xyz.sin(), scaled_xyz.cos()], dim=-1).reshape(xyz.size(0), -1)
         return torch.cat([xyz, pe], dim=-1)
 
-    def forward(self, point_features, global_features, xyz):
+    def render_spectrum(self, peaks, base_vals=None):
+        """将预测的参数化峰 (freq, amp, width) 渲染回 64 维的连续频谱，用于兼容现有可视化并计算辅助 Loss"""
+        B = peaks.size(0)
+        x = torch.linspace(0, 1, self.output_dim, device=peaks.device).view(1, 1, self.output_dim)
+        freqs = peaks[..., 0].unsqueeze(-1)
+        amps = peaks[..., 1].unsqueeze(-1)
+        widths = peaks[..., 2].unsqueeze(-1)
+        
+        gaussians = amps * torch.exp(-0.5 * ((x - freqs) / widths) ** 2)
+        spectrum = gaussians.sum(dim=1)
+        
+        if base_vals is not None:
+            # base_vals: [B, num_peaks]
+            # 将输出空间等分为 num_peaks 个区域，将对应的 base_val 加到相应的区域上
+            bin_size = self.output_dim // self.num_peaks
+            base_spectrum = torch.zeros_like(spectrum)
+            for i in range(self.num_peaks):
+                start_idx = i * bin_size
+                # 最后一个区域包含剩余的部分
+                end_idx = (i + 1) * bin_size if i < self.num_peaks - 1 else self.output_dim
+                base_spectrum[:, start_idx:end_idx] = base_vals[:, i:i+1]
+            spectrum = spectrum + base_spectrum
+            
+        return spectrum
+
+    def forward_direct(self, features):
+        return self.predictor_direct(features), None
+
+    def forward_bipartite(self, features):
+        out = self.predictor_bipartite(features).view(-1, self.num_peaks, 3)
+        freqs = torch.sigmoid(out[..., 0])  # 限制频率在 [0, 1] 之间
+        # 加上初始偏置，避免初始 amp 接近 0 导致梯度消失。真实数据一般最大值在 1 左右
+        amps = F.softplus(out[..., 1] + 1.0) 
+        # 给宽度一个合理的初始值，比如占据整个频段的 1/20
+        widths = F.softplus(out[..., 2] - 2.0) + 0.05 
+        peaks = torch.stack([freqs, amps, widths], dim=-1)
+        rendered = self.render_spectrum(peaks)
+        return rendered, peaks
+
+    def forward_anchor(self, features):
+        out = self.predictor_anchor(features).view(-1, self.num_peaks, 4)
+        # 给 base_val 一个较小的初始偏置，避免负数域梯度消失
+        base_val = F.softplus(out[..., 0] - 1.0)  
+        offset = torch.sigmoid(out[..., 1])  # 限制在 [0, 1] 表示在 bin 内部的相对偏移
+        # 加上初始偏置
+        amps = F.softplus(out[..., 2] + 1.0)      
+        # 给宽度一个合理的初始值，大概覆盖一个 bin
+        widths = F.softplus(out[..., 3] - 2.0) + (1.0 / self.num_peaks) 
+        
+        # 计算绝对频率
+        bin_centers = torch.arange(self.num_peaks, device=features.device).float() / self.num_peaks
+        freqs = bin_centers.unsqueeze(0) + (offset - 0.5) / self.num_peaks
+        freqs = freqs.clamp(0, 1)
+        
+        peaks = torch.stack([freqs, amps, widths], dim=-1)
+        rendered = self.render_spectrum(peaks, base_val)
+        anchors = torch.stack([base_val, freqs, amps, widths], dim=-1)
+        return rendered, anchors
+
+    def forward(self, point_features, global_features, xyz, mode="direct"):
         local_token = self.local_encoder(torch.cat([point_features, self.positional_encoding(xyz)], dim=-1))
         global_token = self.global_encoder(global_features)
         attention_input = torch.stack([local_token, global_token], dim=1)
@@ -80,22 +151,21 @@ class AcousticFieldHead(nn.Module):
             need_weights=False,
         )
         fused_local_token = self.attention_norm(local_token + attention_output.squeeze(1))
-        coarse_features = torch.cat([fused_local_token, global_token], dim=-1)
-        coarse_logits = self.coarse_predictor(coarse_features)
-        coarse_output = F.interpolate(
-            coarse_logits.unsqueeze(1),
-            size=self.output_dim,
-            mode="linear",
-            align_corners=False,
-        ).squeeze(1)
-        residual_output = self.residual_predictor(torch.cat([fused_local_token, global_token, coarse_output], dim=-1))
-        final_output = coarse_output + residual_output
-        return final_output, coarse_output, residual_output
+        features = torch.cat([fused_local_token, global_token], dim=-1)
+        
+        if mode == "bipartite":
+            return self.forward_bipartite(features)
+        elif mode == "anchor":
+            return self.forward_anchor(features)
+        else:
+            return self.forward_direct(features)
 
 
 class MyPipeline(pl.LightningModule):
     def __init__(self, learning_rate=None):
         super().__init__()
+        # 读取配置，决定使用哪种预测模式："direct", "bipartite", "anchor"
+        self.prediction_mode = getattr(cfg, "PREDICTION_MODE", "direct")
         self.learning_rate = learning_rate if learning_rate is not None else getattr(cfg, "LEARNING_RATE", 1e-3)
         self.hidden_dim = getattr(cfg, "HIDDEN_DIM", 256)
         self.output_dim = getattr(cfg, "OUTPUT_DIM", 256)
@@ -106,25 +176,42 @@ class MyPipeline(pl.LightningModule):
         self.acoustic_head = AcousticFieldHead(
             self.hidden_dim,
             self.output_dim,
-            coarse_bins=max(8, int(getattr(cfg, "COARSE_BINS", 64))),
             attention_heads=max(1, int(getattr(cfg, "HEAD_ATTENTION_HEADS", 4))),
+            num_peaks=12,
         )
 
     def build_targets(self, batch_data):
         targets = torch.cat([mel.float().to(self.device).max(dim=-1).values for mel in batch_data["mel_spectrogram"]], dim=0)
         return F.adaptive_avg_pool1d(targets.unsqueeze(1), self.output_dim).squeeze(1)
 
-    def compute_loss_terms(self, output, targets):
+
+
+    def compute_loss_terms(self, output, targets, aux_data=None):
+        # 1. 基础波形回归损失
         smooth_l1_loss = F.smooth_l1_loss(output, targets)
-        pred_dist = F.softplus(output)
-        target_dist = targets.clamp_min(0)
-        pred_dist = pred_dist / pred_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        
+        # 2. 能量分布损失 (EMD 替代方案，更稳定)
+        # 避免除以 0，并且强制在正数域内
+        pred_dist = output.clamp(min=1e-6)
+        target_dist = targets.clamp(min=1e-6)
+        
+        pred_dist = pred_dist / pred_dist.sum(dim=-1, keepdim=True)
+        target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True)
+        
         pred_cdf = torch.cumsum(pred_dist, dim=-1)
         target_cdf = torch.cumsum(target_dist, dim=-1)
-        emd_loss = (pred_cdf - target_cdf).abs().mean()
-        total_loss = smooth_l1_loss * 1 + emd_loss * 1
-        return total_loss, smooth_l1_loss, emd_loss
+        emd_loss = F.l1_loss(pred_cdf, target_cdf)
+        
+        # 3. 能量守恒约束 (强制网络输出能量，打破全0坍塌)
+        # 让预测频谱的总能量，尽量接近真实频谱的总能量
+        pred_energy = output.sum(dim=-1)
+        target_energy = targets.sum(dim=-1)
+        energy_loss = F.l1_loss(pred_energy, target_energy)
+        
+        total_loss = smooth_l1_loss * 10.0 + emd_loss * 1.0 + energy_loss * 1.0
+        mode_loss = torch.tensor(0.0, device=self.device)
+                
+        return total_loss, smooth_l1_loss, emd_loss, mode_loss
 
     def select_global_context_points(self, vertices):
         if vertices.size(0) <= self.global_context_points:
@@ -275,17 +362,18 @@ class MyPipeline(pl.LightningModule):
         point_xyz = torch.cat(impact_points, dim=0)
         local_features = torch.cat(local_feature_groups, dim=0)
         global_features = torch.cat(global_feature_groups, dim=0)
-        output, coarse_output, residual_output = self.acoustic_head(local_features, global_features, point_xyz)
-        loss, smooth_l1_loss, emd_loss = self.compute_loss_terms(output, targets)
-        return loss, output, smooth_l1_loss, emd_loss, coarse_output, residual_output
+        
+        output, aux_data = self.acoustic_head(local_features, global_features, point_xyz, mode=self.prediction_mode)
+        loss, smooth_l1_loss, emd_loss, mode_loss = self.compute_loss_terms(output, targets, aux_data)
+        return loss, output, smooth_l1_loss, emd_loss, mode_loss
 
     def training_step(self, batch, batch_idx):
-        loss, output, smooth_l1_loss, emd_loss, coarse_output, residual_output = self(batch)
+        loss, output, smooth_l1_loss, emd_loss, mode_loss = self(batch)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("train_smooth_l1_loss", smooth_l1_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("train_emd_loss", emd_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        self.log("train_coarse_abs_mean", coarse_output.abs().mean(), on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        self.log("train_residual_abs_mean", residual_output.abs().mean(), on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        if self.prediction_mode in ["bipartite", "anchor"]:
+            self.log("train_mode_loss", mode_loss, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         
         opt = self.optimizers()
         if opt:
@@ -300,12 +388,13 @@ class MyPipeline(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, output, smooth_l1_loss, emd_loss, coarse_output, residual_output = self(batch)
+        loss, output, smooth_l1_loss, emd_loss, mode_loss = self(batch)
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("val_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("val_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        self.log("val_coarse_abs_mean", coarse_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        self.log("val_residual_abs_mean", residual_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        if self.prediction_mode in ["bipartite", "anchor"]:
+            self.log("val_mode_loss", mode_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+            
         if batch_idx == 0 and getattr(self.logger, "experiment", None) is not None:
             targets = self.build_targets(batch)
             report = self.build_prediction_report(batch, targets, output, loss, stage="val")
@@ -313,12 +402,12 @@ class MyPipeline(pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, _, smooth_l1_loss, emd_loss, coarse_output, residual_output = self(batch)
+        loss, _, smooth_l1_loss, emd_loss, mode_loss = self(batch)
         self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch["num_impacts"].sum().item())
         self.log("test_smooth_l1_loss", smooth_l1_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         self.log("test_emd_loss", emd_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        self.log("test_coarse_abs_mean", coarse_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
-        self.log("test_residual_abs_mean", residual_output.abs().mean(), on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
+        if self.prediction_mode in ["bipartite", "anchor"]:
+            self.log("test_mode_loss", mode_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=batch["num_impacts"].sum().item())
         return loss
 
     def configure_optimizers(self):
