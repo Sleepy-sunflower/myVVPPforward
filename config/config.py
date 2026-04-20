@@ -35,7 +35,7 @@ class Config:
     
     # --- GPU 配置 ---
     # 模式1：手动指定 GPU (例如 [0, 1])。如果不为空，则直接使用指定的 GPU
-    GPU_IDS = [3]
+    GPU_IDS = [0]
     # 模式2：自动寻找空闲 GPU。如果 AUTO_FIND_GPUS 为 True，则忽略 GPU_IDS，自动寻找 DEVICES 个空闲 GPU
     AUTO_FIND_GPUS = False
     # 使用的设备数量（手动指定时会被自动同步，自动寻找时用于指定寻找的数量）

@@ -14,6 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 from config.config import cfg
+import librosa
 
 
 
@@ -297,6 +298,21 @@ class VVImpactDataset(Dataset):
             "tensor": spec_tensor,
         }
         return spec_tensor
+    
+    def load_audio(self, audio_path):
+        audio, sr = librosa.load(audio_path, sr=32000)
+        return audio, sr
+    
+    def load_spec_from_audio(self, audio_path):
+        audio, sr = self.load_audio(audio_path)
+        # resample to 32000
+        
+        # spec = librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=256, fmax=16000)
+        D = librosa.stft(audio, n_fft=512)
+        S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max) # [-80, 0]
+        # to [-1, 1]
+        spec = (S_db + 40) / 40
+        return spec
 
     def __len__(self):
         return len(self.samples)
@@ -359,9 +375,12 @@ class VVImpactDataset(Dataset):
             self.interp_cache[cache_key] = cached
         return cached
 
-    def load_spec(self, spec_path):
+    def load_spec(self, audio_path, spec_path):
         # TODO: 后续改成从音频现算频谱，而不是从图片加载。从图片加载可能不准确，但是可以作为测试模型的可训练性与可视化用
-        spec_tensor = self.load_spec_tensor(spec_path)
+        spec = self.load_spec_from_audio(audio_path)
+        spec_tensor = torch.from_numpy(spec).float()
+        # 删去spec的前两列，以规避边界问题
+        spec_tensor = spec_tensor[:, 2:]
         if self.train_only:
             return spec_tensor, None
         with Image.open(spec_path) as spec_image:
@@ -399,7 +418,7 @@ class VVImpactDataset(Dataset):
             impact_audio_path = []
 
         for impact in sample["samples"]:
-            spec_tensor, preview_tensor = self.load_spec(impact["spec_path"])
+            spec_tensor, preview_tensor = self.load_spec(impact["wav_path"], impact["spec_path"])
             impact_specs.append(spec_tensor)
             impact_vertex_index.append(impact["vertex_id"])
             if not self.train_only:
